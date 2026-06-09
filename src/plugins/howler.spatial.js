@@ -219,8 +219,20 @@
           sound._pos = [pan, 0, 0];
 
           if (sound._node) {
-            // If we are falling back, make sure the panningModel is equalpower.
-            sound._pannerAttr.panningModel = 'equalpower';
+            // In spatial fallback mode, create a new _pannerAttr object with equalpower to avoid
+            // mutating the shared reference and polluting future pos() calls on this sound.
+            if (pannerType === 'spatial') {
+              sound._pannerAttr = {
+                coneInnerAngle: sound._pannerAttr.coneInnerAngle,
+                coneOuterAngle: sound._pannerAttr.coneOuterAngle,
+                coneOuterGain: sound._pannerAttr.coneOuterGain,
+                distanceModel: sound._pannerAttr.distanceModel,
+                maxDistance: sound._pannerAttr.maxDistance,
+                panningModel: 'equalpower',
+                refDistance: sound._pannerAttr.refDistance,
+                rolloffFactor: sound._pannerAttr.rolloffFactor,
+              };
+            }
 
             // Check if there is a panner setup and create a new one if not.
             if (!sound._panner || !sound._panner.pan) {

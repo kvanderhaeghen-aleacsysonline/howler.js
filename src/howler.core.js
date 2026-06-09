@@ -359,7 +359,9 @@
 
               if (sound && sound._node && !sound._node._unlocked) {
                 sound._node._unlocked = true;
+                var currentTime = sound._node.currentTime;
                 sound._node.load();
+                sound._node.currentTime = currentTime;
               }
             }
           }
@@ -382,7 +384,9 @@
 
         // Calling resume() on a stack initiated by user gesture is what actually unlocks the audio on Android Chrome >= 55.
         if (typeof self.ctx.resume === 'function') {
-          self.ctx.resume();
+          self.ctx.resume().catch(function(err) {
+            console.warn('AudioContext resume failed during unlock:', err.name + ':', err.message);
+          });
         }
 
         // Setup a timeout to check that we are unlocked on the next event loop.
@@ -391,6 +395,15 @@
 
           // Update the unlocked state and prevent this check from happening again.
           self._audioUnlocked = true;
+
+          // Re-resume the AudioContext whenever it gets suspended after backgrounding (iOS).
+          if (Howler.usingWebAudio && Howler.ctx.addEventListener) {
+            Howler.ctx.addEventListener('statechange', function() {
+              if (Howler.ctx.state !== 'running' && Howler._audioUnlocked) {
+                Howler.ctx.resume();
+              }
+            });
+          }
 
           // Remove the touch start listener.
           document.removeEventListener('touchstart', unlock, true);
@@ -529,6 +542,12 @@
           for (var i=0; i<self._howls.length; i++) {
             self._howls[i]._emit('resume');
           }
+        }).catch(function(err) {
+          console.warn('AudioContext resume failed:', err.name + ':', err.message);
+          self.state = 'suspended';
+          for (var i=0; i<self._howls.length; i++) {
+            self._howls[i]._emit('resumeerror', null, err);
+          }
         });
 
         if (self._suspendTimer) {
@@ -573,8 +592,10 @@
     init: function(o) {
       var self = this;
 
-      // If we don't have an AudioContext created yet, run the setup.
-      if (!Howler.ctx) {
+      // If we don't have an AudioContext created yet and we're not in HTML5-only mode, run
+      // the setup. Skipping this for html5:true avoids creating an AudioContext on iOS,
+      // which would break the iOS Control Center media notification (#1383).
+      if (!Howler.ctx && !o.html5) {
         setupAudioContext();
       }
 
@@ -977,7 +998,9 @@
         // Play immediately if ready, or wait for the 'canplaythrough'e vent.
         var loadedNoReadyState = (window && window.ejecta) || (!node.readyState && Howler._navigator.isCocoonJS);
         if (node.readyState >= 3 || loadedNoReadyState) {
-          playHtml5();
+          // Defer via setTimeout to avoid a race on iOS where calling play() immediately
+          // after pause() causes the audio node to re-pause before playback starts.
+          setTimeout(playHtml5, 0);
         } else {
           self._playLock = true;
           self._state = 'loading';
@@ -2313,7 +2336,7 @@
       var self = this;
 
       // Fire an error event and pass back the code.
-      self._parent._emit('loaderror', self._id, self._node.error ? self._node.error.code : 0);
+      self._parent._emit('loaderror', self._id, self._node.error ? self._node.error.message || self._node.error.code : 0);
 
       // Clear the event listener.
       self._node.removeEventListener('error', self._errorFn, false);
