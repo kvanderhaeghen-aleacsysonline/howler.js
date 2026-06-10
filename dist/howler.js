@@ -405,6 +405,48 @@
             });
           }
 
+          // iOS Safari can silently lose the audio session when another tab/app takes it over,
+          // while ctx.state still (incorrectly) reports 'running' and no statechange event fires.
+          // On returning to the tab, detect this zombie context by checking whether currentTime
+          // is advancing, and force a suspend/resume cycle to re-acquire the audio session.
+          if (Howler.usingWebAudio && typeof document !== 'undefined' && document.addEventListener) {
+            document.addEventListener('visibilitychange', function() {
+              if (document.visibilityState !== 'visible' || !Howler.ctx) {
+                return;
+              }
+
+              // A non-running state is already handled by the statechange listener above,
+              // but resume here as well in case that event doesn't fire.
+              if (Howler.ctx.state !== 'running') {
+                Howler.ctx.resume();
+                return;
+              }
+
+              // State says 'running': verify it by sampling currentTime twice.
+              var checkTime = Howler.ctx.currentTime;
+              setTimeout(function() {
+                if (!Howler.ctx || Howler.ctx.state !== 'running' || Howler.ctx.currentTime !== checkTime) {
+                  return;
+                }
+
+                // Zombie context: clock is frozen while state claims 'running'.
+                // A suspend/resume cycle forces WebKit to re-acquire the audio session.
+                Howler.ctx.suspend().then(function() {
+                  return Howler.ctx.resume();
+                }).then(function() {
+                  Howler.state = 'running';
+
+                  // Emit to all Howls that the audio has resumed.
+                  for (var i=0; i<Howler._howls.length; i++) {
+                    Howler._howls[i]._emit('resume');
+                  }
+                }).catch(function(err) {
+                  console.warn('AudioContext suspend/resume cycle failed:', err.name + ':', err.message);
+                });
+              }, 100);
+            });
+          }
+
           // Remove the touch start listener.
           document.removeEventListener('touchstart', unlock, true);
           document.removeEventListener('touchend', unlock, true);
