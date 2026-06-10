@@ -8,11 +8,13 @@ var version = 'v' + require('./package.json').version;
 var CORE_PREAMBLE = '/*! howler.js ' + version + ' | (c) 2013-2020, James Simpson of GoldFire Studios | MIT License | howlerjs.com */';
 var SPATIAL_PREAMBLE = '/*! howler.js ' + version + ' | Spatial Plugin | (c) 2013-2020, James Simpson of GoldFire Studios | MIT License | howlerjs.com */';
 
-// Update the version header line in a source file.
+// Update the version header line in a source file, preserving original line endings.
 function setVersionHeader(file, lineIndex) {
-  var lines = fs.readFileSync(file, 'utf8').split('\n');
+  var content = fs.readFileSync(file, 'utf8');
+  var eol = content.includes('\r\n') ? '\r\n' : '\n';
+  var lines = content.split(eol);
   lines[lineIndex] = ' *  howler.js ' + version;
-  fs.writeFileSync(file, lines.join('\n'));
+  fs.writeFileSync(file, lines.join(eol));
 }
 
 // Minify a source file and write to dest with a preamble comment.
