@@ -1,3 +1,18 @@
+## 2.2.5 (June 12, 2026) — fork
+Fork release: cherry-picked open upstream PRs plus an iOS 17+ audio-session recovery developed in this fork.
+
+- `ADDED` Recovery for the iOS 17+ stolen audio session: when another tab/app takes over audio, the AudioContext keeps reporting `running` while routed to a muted output and `resume()`/suspend-resume cycles never restore sound (WebKit [#263627](https://bugs.webkit.org/show_bug.cgi?id=263627)). Detection combines a sticky taint on unexpected `interrupted`/`suspended` state drops (including the drop iOS delivers mid-swipe while still `visible`, and the one delivered a few ms after returning to the tab) with a paced-clock check on tab return (frozen clock or >3x wall-time surge while claiming `running`). Recovery runs on the next user gesture: a short looped silent HTML5 clip reclaims the iOS media session, the context is closed and rebuilt in the same gesture, every sound's gain node is rewired (decoded buffers are reused, nothing re-downloads), the unlock machinery is re-armed and previously playing sounds resume from their seek positions with a `resume` event to all Howls. iOS/iPadOS only (`isIOSDevice` gate). Diagnostics via `Howler.recoveryDebug = true`.
+- `CHANGED` Never auto-resume the context while the page is hidden or after a takeover signal — on iOS 17+ such resumes "succeed" onto the muted route and destroy the evidence needed for detection. Eager resume remains only for visible in-place interruptions (phone call, Siri), which is the correct iOS < 17 recovery.
+- `CHANGED` The context `statechange` recovery listener no longer fights `_autoSuspend`'s own deliberate suspensions and is guarded against duplicate registration.
+- `CHANGED` Cross-platform build: `npm run build` now runs `build.js` via the uglify-js Node API instead of a macOS-only shell pipeline (`sed -i ''`/`awk`/`perl`); line endings of source headers are preserved on Windows.
+- `FIXED` Audio not resuming after backgrounding on iOS, superseding the plain statechange-resume approach ([#1770](https://github.com/goldfire/howler.js/pull/1770)).
+- `FIXED` Race condition when calling `play()` right after `pause()` on iOS HTML5 audio ([#1761](https://github.com/goldfire/howler.js/pull/1761)).
+- `FIXED` Unhandled promise rejections when `AudioContext.resume()` fails; emits `resumeerror` to all Howls ([#1764](https://github.com/goldfire/howler.js/pull/1764)).
+- `FIXED` HTML5 audio position was reset when unlocking audio ([#1737](https://github.com/goldfire/howler.js/pull/1737)).
+- `FIXED` iOS Control Center notification broken in forced HTML5 mode — no AudioContext is created when `html5: true` ([#1530](https://github.com/goldfire/howler.js/pull/1530)).
+- `FIXED` Playing a sound with `stereo()` changed the `panningModel` for all future positional playback of that sound ([#1758](https://github.com/goldfire/howler.js/pull/1758)).
+- `FIXED` `loaderror` events now carry the descriptive `MediaError.message` when available instead of only the numeric code ([#1727](https://github.com/goldfire/howler.js/pull/1727)).
+
 ## 2.2.3 (September 20, 2023)
 - `FIXED` Invalid regex detection of Opera versions 100+ ([#1676](https://github.com/goldfire/howler.js/pull/1676)).
 - `FIXED` The `pannerAttr` method wouldn't set the values the first time it was called ([#1497](https://github.com/goldfire/howler.js/issues/1497)).

@@ -1,5 +1,14 @@
 [![howler.js](https://s3.amazonaws.com/howler.js/howler-logo.png "howler.js")](https://howlerjs.com)
 
+# About this fork
+This fork (`release/fixes`, v2.2.5) adds fixes that are not (yet) merged upstream. See [CHANGELOG.md](CHANGELOG.md#225-june-12-2026) for the full list. The two main additions:
+
+* **iOS 17+ stolen audio-session recovery** — when another tab or app takes over the audio session, iOS keeps reporting the `AudioContext` as `running` while its output is silently routed to a muted destination; `resume()` and suspend/resume cycles report success but never restore sound (WebKit [#263627](https://bugs.webkit.org/show_bug.cgi?id=263627), [#231105](https://bugs.webkit.org/show_bug.cgi?id=231105)). This fork detects the takeover (sticky interruption taint + a paced-clock check on tab return) and recovers on the next user gesture: a short silent HTML5 clip reclaims the iOS media session, then the `AudioContext` is rebuilt in that same gesture and all sounds are rewired and resumed. iOS/iPadOS only; other platforms are untouched. Diagnostics: `Howler.recoveryDebug = true`.
+  * App-side requirement: do not call `Howler.ctx.resume()` yourself and avoid starting sounds while the page is hidden — background resumes re-attach the muted route and defeat the detection.
+* **Selected open upstream PRs** — cherry-picked bug fixes for iOS playback, HTML5 audio and the spatial plugin (see changelog).
+
+The build also runs cross-platform now: `npm run build` executes [build.js](build.js) (Node-only, no shell tools required).
+
 # Sponsors
 Thank you to our sponsors for their support of this project:
 
