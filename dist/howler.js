@@ -12,6 +12,28 @@
 
   'use strict';
 
+  // Diagnostic logging for the iOS audio-session recovery. Off by default; enable
+  // from the console or app code via `Howler.recoveryDebug = true`.
+  var recLog = function() {
+    if (typeof Howler === 'undefined' || Howler.recoveryDebug !== true) {
+      return;
+    }
+    var args = Array.prototype.slice.call(arguments);
+    args.unshift('[Howler recovery]');
+    console.log.apply(console, args);
+  };
+
+  // True only on iOS/iPadOS devices (modern iPads report platform 'MacIntel', so
+  // also check for Apple touch hardware). All audio-session recovery below is
+  // iOS-specific behavior and must never run on Android or desktop.
+  var isIOSDevice = (function() {
+    if (typeof navigator === 'undefined') {
+      return false;
+    }
+    return /iP(hone|od|ad)/.test(navigator.platform || '') ||
+      ((navigator.platform === 'MacIntel' || /Macintosh/.test(navigator.userAgent || '')) && navigator.maxTouchPoints > 1);
+  })();
+
   /** Global Methods **/
   /***************************************************************************/
 
@@ -396,53 +418,130 @@
           // Update the unlocked state and prevent this check from happening again.
           self._audioUnlocked = true;
 
-          // Re-resume the AudioContext whenever it gets suspended after backgrounding (iOS).
-          if (Howler.usingWebAudio && Howler.ctx.addEventListener) {
+          // Run a pending context-rebuild resume now that audio is unlocked again.
+          if (Howler._pendingRecoveryResume) {
+            Howler._pendingRecoveryResume();
+          }
+
+          // Watch for the AudioContext being interrupted/suspended behind our back (iOS
+          // audio-session takeover). Guard against duplicate registration: unlock can
+          // complete more than once per context (it is armed on touchstart, touchend,
+          // click and keydown).
+          if (isIOSDevice && Howler.usingWebAudio && Howler.ctx.addEventListener && !Howler.ctx._howlerStatechangeAttached) {
+            Howler.ctx._howlerStatechangeAttached = true;
             Howler.ctx.addEventListener('statechange', function() {
-              if (Howler.ctx.state !== 'running' && Howler._audioUnlocked) {
-                Howler.ctx.resume();
+              // Stand down while a deliberate rebuild is in progress.
+              if (Howler._recovering || !Howler.ctx) {
+                return;
+              }
+
+              // Only react to state drops howler did NOT initiate. _autoSuspend sets
+              // Howler.state to 'suspending'/'suspended' before touching the context,
+              // so Howler.state === 'running' here means iOS changed it behind our back.
+              if (Howler.ctx.state !== 'running' && Howler._audioUnlocked && Howler.state === 'running') {
+                // The audible session was (or is being) taken over. iOS fires this DURING
+                // the swipe to another tab while this page still reports 'visible', and
+                // any resume afterwards "succeeds" onto a muted output route. Remember
+                // the theft no matter the visibility — the next return to this tab
+                // rebuilds the context. Cleared only by rebuild.
+                recLog('unexpected ctx state:', Howler.ctx.state, '| visibility:', typeof document !== 'undefined' ? document.visibilityState : '-');
+                Howler._ctxInterrupted = true;
+
+                // Never resume while the tab is hidden: the resume "succeeds" (state
+                // running, clock advancing) but onto the muted route, destroying the
+                // frozen-clock evidence. Recovery happens in visibilitychange instead.
+                if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+                  Howler._resumeOnVisible = true;
+                  return;
+                }
+
+                // iOS delivers the takeover suspension AFTER the visibilitychange back to
+                // visible, so the visibility handler has already run and found nothing.
+                // An unexpected drop shortly after returning to the tab is the signature
+                // of a stolen session: rebuild on the next gesture instead of resuming
+                // (a resume would land on the muted route).
+                var sinceVisible = new Date().getTime() - (Howler._lastVisibleAt || 0);
+                if (sinceVisible < 2000) {
+                  recLog('drop', sinceVisible, 'ms after tab return -> arming rebuild');
+                  Howler._resumeOnVisible = false;
+                  Howler._ctxInterrupted = false;
+                  Howler._armRebuildOnGesture();
+                  return;
+                }
+
+                // Visible in-place interruption (phone call, Siri): eager resume is what
+                // recovers audio here on iOS < 17, and the sticky taint above schedules a
+                // rebuild for the iOS 17+ case where this resume lands on a muted route.
+                recLog('in-place interruption -> eager resume');
+                Howler.ctx.resume().catch(function(err) {
+                  console.warn('AudioContext resume failed after interruption:', err.name + ':', err.message);
+                });
               }
             });
           }
 
-          // iOS Safari can silently lose the audio session when another tab/app takes it over,
-          // while ctx.state still (incorrectly) reports 'running' and no statechange event fires.
-          // On returning to the tab, detect this zombie context by checking whether currentTime
-          // is advancing, and force a suspend/resume cycle to re-acquire the audio session.
-          if (Howler.usingWebAudio && typeof document !== 'undefined' && document.addEventListener) {
+          // iOS Safari can silently lose the audio session when another tab/app takes it
+          // over, often with NO statechange event: ctx.state keeps reporting 'running'.
+          // The only reliable recovery is a full AudioContext rebuild — a plain resume()
+          // or a suspend/resume cycle reports success but leaves the context rendering
+          // to a muted output route (confirmed on device, iOS 17+).
+          if (isIOSDevice && Howler.usingWebAudio && typeof document !== 'undefined' && document.addEventListener && !Howler._visibilityRecoveryAttached) {
+            Howler._visibilityRecoveryAttached = true;
+
             document.addEventListener('visibilitychange', function() {
-              if (document.visibilityState !== 'visible' || !Howler.ctx) {
+              if (document.visibilityState !== 'visible' || !Howler.ctx || Howler._recovering) {
                 return;
               }
 
-              // A non-running state is already handled by the statechange listener above,
-              // but resume here as well in case that event doesn't fire.
-              if (Howler.ctx.state !== 'running') {
-                Howler.ctx.resume();
+              // Timestamp the return: iOS delivers takeover suspensions a few ms AFTER
+              // this event, and the statechange listener uses this to recognize them.
+              Howler._lastVisibleAt = new Date().getTime();
+
+              // The audible session was taken over at some point: an 'interrupted' or
+              // unexpected 'suspended' statechange was seen (possibly while still
+              // 'visible' mid-swipe). Context-level health signals can't be trusted
+              // after that — rebuild on the next gesture.
+              if (Howler._resumeOnVisible || Howler._ctxInterrupted) {
+                recLog('visible + tainted session -> arming rebuild');
+                Howler._resumeOnVisible = false;
+                Howler._ctxInterrupted = false;
+                Howler._armRebuildOnGesture();
                 return;
               }
 
-              // State says 'running': verify it by sampling currentTime twice.
+              // The context is in an unexpected non-running state with no event seen
+              // (Howler.state 'running' means howler did not suspend it itself): the
+              // session was stolen silently. Rebuild rather than resume — resuming
+              // here lands on the muted route and destroys the evidence.
+              if (Howler.ctx.state !== 'running' && Howler.state === 'running') {
+                recLog('visible + unexpected ctx state:', Howler.ctx.state, '-> arming rebuild');
+                Howler._armRebuildOnGesture();
+                return;
+              }
+
+              // State says 'running': verify the clock advances at REAL-TIME RATE. Two
+              // failure signatures, both confirmed on device (iOS 17+):
+              //  - frozen: clock not advancing at all while claiming 'running'.
+              //  - surge: clock advancing far faster than wall time. A context whose
+              //    audible route was stolen renders unpaced into a null output and
+              //    "catches up" several seconds per 100ms after the tab returns. A
+              //    healthy hardware-paced clock advances at ~1x wall time.
               var checkTime = Howler.ctx.currentTime;
+              var checkWall = new Date().getTime();
               setTimeout(function() {
-                if (!Howler.ctx || Howler.ctx.state !== 'running' || Howler.ctx.currentTime !== checkTime) {
+                if (!Howler.ctx || Howler._recovering || Howler.ctx.state !== 'running') {
                   return;
                 }
 
-                // Zombie context: clock is frozen while state claims 'running'.
-                // A suspend/resume cycle forces WebKit to re-acquire the audio session.
-                Howler.ctx.suspend().then(function() {
-                  return Howler.ctx.resume();
-                }).then(function() {
-                  Howler.state = 'running';
+                var ctxDelta = Howler.ctx.currentTime - checkTime;
+                var wallDelta = (new Date().getTime() - checkWall) / 1000;
+                var rate = wallDelta > 0 ? (ctxDelta / wallDelta) : 0;
+                recLog('paced-clock check | ctxDelta:', ctxDelta.toFixed(3), '| rate:', rate.toFixed(2));
 
-                  // Emit to all Howls that the audio has resumed.
-                  for (var i=0; i<Howler._howls.length; i++) {
-                    Howler._howls[i]._emit('resume');
-                  }
-                }).catch(function(err) {
-                  console.warn('AudioContext suspend/resume cycle failed:', err.name + ':', err.message);
-                });
+                if (ctxDelta === 0 || rate > 3) {
+                  recLog(ctxDelta === 0 ? 'frozen clock -> arming rebuild' : 'unpaced surge -> arming rebuild');
+                  Howler._armRebuildOnGesture();
+                }
               }, 100);
             });
           }
@@ -599,6 +698,191 @@
       } else if (self.state === 'suspending') {
         self._resumeAfterSuspend = true;
       }
+
+      return self;
+    },
+
+    /**
+     * Defer the context rebuild to the next user gesture. A context created outside
+     * a gesture while another tab still holds the audible session is born muted
+     * with no detectable signal — creating it inside the gesture (capture phase, so
+     * it runs before app handlers on the same tap) is the only moment iOS reliably
+     * grants the audible route.
+     * @return {Howler}
+     */
+    _armRebuildOnGesture: function() {
+      var self = this || Howler;
+
+      if (self._rebuildArmed) {
+        return self;
+      }
+      self._rebuildArmed = true;
+      recLog('rebuild armed, waiting for user gesture');
+
+      var doRebuild = function() {
+        document.removeEventListener('touchend', doRebuild, true);
+        document.removeEventListener('click', doRebuild, true);
+        document.removeEventListener('keydown', doRebuild, true);
+        self._rebuildArmed = false;
+        recLog('gesture received -> kicking media session + rebuilding context');
+
+        // Wrest the iOS media session back from the other tab before creating the
+        // new context. iOS keeps Now Playing ownership with the previous tab even
+        // when it is silent, and a Web Audio context alone (even gesture-created)
+        // is not granted the audible route while another tab owns the session.
+        // HTML5 media elements DO claim ownership — play a short silent clip in
+        // this same gesture, looped briefly so the claim registers.
+        try {
+          var kick = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
+          kick.loop = true;
+          self._sessionKick = kick;
+
+          var stopKick = function() {
+            kick.pause();
+            self._sessionKick = null;
+          };
+
+          // Stop the kick only AFTER playback has actually started — a fixed timer
+          // can fire before play() resolves on a busy main thread, aborting the
+          // play request and losing the media-session claim entirely.
+          var kickPlay = kick.play();
+          if (kickPlay && typeof kickPlay.then === 'function') {
+            kickPlay.then(function() {
+              recLog('session kick playing');
+              setTimeout(stopKick, 1000);
+            }).catch(function(err) {
+              recLog('session kick failed:', err.name + ':', err.message);
+              self._sessionKick = null;
+            });
+          } else {
+            setTimeout(stopKick, 1000);
+          }
+        } catch(e) {
+          recLog('session kick error:', e.message);
+        }
+
+        self._rebuildAudioContext();
+      };
+
+      document.addEventListener('touchend', doRebuild, true);
+      document.addEventListener('click', doRebuild, true);
+      document.addEventListener('keydown', doRebuild, true);
+
+      return self;
+    },
+
+    /**
+     * Close the current AudioContext and build a fresh one, rewiring all Web Audio
+     * sounds onto it. This is the only known way to re-acquire the audible audio
+     * session on iOS 17+ after another tab/app has taken it over: the stolen context
+     * keeps reporting 'running' with an advancing clock, resume() resolves, but the
+     * output stays routed to a muted destination. Decoded AudioBuffers survive the
+     * swap (they are not tied to a context), so no sources are re-downloaded.
+     * @return {Howler}
+     */
+    _rebuildAudioContext: function() {
+      var self = this || Howler;
+
+      if (!self.usingWebAudio || !self.ctx) {
+        return self;
+      }
+
+      // Capture all currently playing Web Audio sounds and pause them internally
+      // (no 'pause' event) so they can be resumed on the new context.
+      var resumeList = [];
+      var i, j, ids, sound;
+      for (i=0; i<self._howls.length; i++) {
+        if (!self._howls[i]._webAudio) {
+          continue;
+        }
+
+        ids = self._howls[i]._getSoundIds();
+        for (j=0; j<ids.length; j++) {
+          sound = self._howls[i]._soundById(ids[j]);
+          if (sound && !sound._paused) {
+            resumeList.push({howl: self._howls[i], id: ids[j]});
+            self._howls[i].pause(ids[j], true);
+          }
+        }
+      }
+      // Tear down the dead context and create a fresh one (with a new master gain).
+      self._recovering = true;
+      try {
+        if (typeof self.ctx.close !== 'undefined') {
+          self.ctx.close();
+        }
+      } catch(e) {}
+      self.ctx = null;
+      setupAudioContext();
+      recLog('rebuild: new ctx created | state:', self.ctx ? self.ctx.state : 'FAILED');
+
+      if (!self.ctx) {
+        self._recovering = false;
+        return self;
+      }
+
+      // Recreate each Web Audio sound's gain node on the new context. Panner nodes
+      // from the old context are dropped; the spatial plugin re-creates them on the
+      // next pos()/stereo() call from the preserved _pannerAttr/_pos values.
+      for (i=0; i<self._howls.length; i++) {
+        if (!self._howls[i]._webAudio) {
+          continue;
+        }
+
+        ids = self._howls[i]._getSoundIds();
+        for (j=0; j<ids.length; j++) {
+          sound = self._howls[i]._soundById(ids[j]);
+          if (sound && sound._node) {
+            var volume = (self._muted || sound._muted || self._howls[i]._muted) ? 0 : sound._volume;
+            sound._node = (typeof self.ctx.createGain === 'undefined') ? self.ctx.createGainNode() : self.ctx.createGain();
+            sound._node.gain.setValueAtTime(volume, self.ctx.currentTime);
+            sound._node.paused = true;
+            sound._node.connect(self.masterGain);
+
+            if (sound._panner) {
+              sound._panner = undefined;
+            }
+          }
+        }
+      }
+
+      self._recovering = false;
+
+      // The fresh context may require a user gesture to start on iOS: re-arm the
+      // unlock machinery. Prevent the sampleRate check from unloading everything.
+      self._mobileUnloaded = true;
+      self._audioUnlocked = false;
+      self.autoUnlock = true;
+      self._unlockAudio();
+
+      // Try to start it right away; tab foregrounding is sometimes enough. On iOS the
+      // resume() promise stays pending until the next user gesture unlocks the context,
+      // so this also covers the gesture case. The pending-recovery hook is a fallback
+      // invoked by the unlock handler in case the promise rejects instead.
+      var resumed = false;
+      var finishResume = function() {
+        if (resumed || !self.ctx) {
+          return;
+        }
+        resumed = true;
+        self._pendingRecoveryResume = null;
+
+        recLog('rebuild: new ctx running | resuming', resumeList.length, 'sound(s)');
+        self.state = 'running';
+        for (var k=0; k<resumeList.length; k++) {
+          resumeList[k].howl.play(resumeList[k].id);
+        }
+
+        // Emit to all Howls that the audio has resumed.
+        for (var k=0; k<self._howls.length; k++) {
+          self._howls[k]._emit('resume');
+        }
+      };
+
+      self._pendingRecoveryResume = finishResume;
+      self.ctx.resume().then(finishResume).catch(function(err) {
+        console.warn('AudioContext rebuild resume pending user gesture:', err.name + ':', err.message);
+      });
 
       return self;
     }
